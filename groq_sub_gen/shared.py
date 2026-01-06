@@ -89,11 +89,11 @@ class Config:
     GROQ_API_KEY: str = ""
     model: str = "whisper-large-v3-turbo"
     output_dir: str = "output"
-    language: str = "ja"
+    language: str = "en"
     # path_to_watch: str = "./watch"
     cookies: str = ""
 
-    def __init__(self, process_locally=True, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="ja", path_to_watch="./watch", cookies="", *args, **kwargs):
+    def __init__(self, process_locally=True, GROQ_API_KEY="", whisper_model="turbo", RUN_ASB_WEBSOCKET_SERVER=True, model="whisper-large-v3-turbo", output_dir="output", language="en", path_to_watch="./watch", cookies="", *args, **kwargs):
         self.process_locally = process_locally
         self.GROQ_API_KEY = GROQ_API_KEY
         self.whisper_model = whisper_model
@@ -220,7 +220,7 @@ def timed_input(prompt, timeout=5):
     return user_input[0]
 
 
-def is_language_desired(url, desired='ja'):
+def is_language_desired(url, desired='en'):
     """
     Checks if the YouTube video is in desired language.
     """
@@ -300,13 +300,17 @@ class StableTSProcessor:
             logging.error(f"Failed to load stable-ts model: {e}")
             raise SubtitleError(f"Failed to load stable-ts model: {e}")
 
-    def get_audio_segments(self, audio_path, language="ja", word_timestamps=False, vad=True, min_silence_duration_ms=250):
+    def get_audio_segments(self, audio_path, language=None, word_timestamps=False, vad=True, min_silence_duration_ms=250):
         """
         Run stable-ts (via stable_whisper) on the given audio file and return parsed segments/words.
         Returns a dict with 'segments' and 'words' keys, similar to groq output.
         """
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Use config.language as default if language is not specified
+        if language is None:
+            language = config.language
 
         # Transcribe
         try:
@@ -315,6 +319,7 @@ class StableTSProcessor:
                 word_timestamps=True,
                 vad=vad,
                 temperature=0.0,
+                language=language,
                 # Add any extra args if needed
             )
         except Exception as e:

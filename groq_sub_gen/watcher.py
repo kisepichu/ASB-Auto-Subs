@@ -1,4 +1,5 @@
 import base64
+import glob
 import json
 import logging
 import os
@@ -140,7 +141,9 @@ LANGUAGE_CODES = {
 
 ALLOWED_FILE_EXTENSIONS = ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"]
 MAX_FILE_SIZE_MB = 25
-CHUNK_SIZE_MB = 25
+CHUNK_SIZE_MB = 5
+ENABLE_DOWNSAMPLE = False  # Set to False to skip downsampling and only use splitting
+KEEP_SPLIT_FILES = True  # Set to True to keep split files for debugging
 
 
 # --- Custom Exception ---
@@ -188,13 +191,16 @@ class SubtitleProcessor:
             ) from e
 
     def _cleanup_temp_files(self):
-        for f in self._temp_files:
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-                    logging.info(f"Cleaned up temporary file: {f}")
-            except OSError as e:
-                logging.warning(f"Could not remove temporary file {f}: {e}")
+        if not KEEP_SPLIT_FILES:
+            for f in self._temp_files:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                        logging.info(f"Cleaned up temporary file: {f}")
+                except OSError as e:
+                    logging.warning(f"Could not remove temporary file {f}: {e}")
+        else:
+            logging.info(f"Keeping {len(self._temp_files)} temporary files (KEEP_SPLIT_FILES=True)")
         self._temp_files = []
 
     def _handle_groq_error(self, e, model_name):
@@ -280,15 +286,40 @@ class SubtitleProcessor:
                 text=True,
                 check=True,
             )
-            bitrate = int(result.stdout.strip())
-            return bitrate
+            bitrate_str = result.stdout.strip()
+            if bitrate_str and bitrate_str != "N/A":
+                bitrate = int(bitrate_str)
+                return bitrate
+            else:
+                # If bitrate is not available, try to get it from format
+                cmd_format = [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=bit_rate",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    input_file_path,
+                ]
+                result_format = subprocess.run(
+                    cmd_format,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                )
+                bitrate_str = result_format.stdout.strip()
+                if bitrate_str and bitrate_str != "N/A":
+                    return int(bitrate_str)
         except (subprocess.CalledProcessError, ValueError) as e:
-            logging.warning(f"Could not get audio bitrate: {e}. Using default 128kbps.")
-            return 128000  # Default to 128 kbps
+            logging.warning(f"Could not get audio bitrate: {e}. Using default 192kbps.")
+        return 192000  # Default to 192 kbps (higher quality default)
 
     def _split_audio(self, input_file_path, chunk_size_mb):
         """
         Split audio file into chunks using ffmpeg based on time duration.
+        For MP3 files, re-encoding is used to prevent audio corruption at segment boundaries.
         This ensures each chunk is a valid audio file that can be processed.
         """
         base_name, extension = os.path.splitext(input_file_path)
@@ -318,41 +349,81 @@ class SubtitleProcessor:
 
             # Use ffmpeg segment muxer to split by time
             output_pattern = f"{base_name}_part%03d{extension}"
-            cmd = [
-                "ffmpeg",
-                "-y",  # Overwrite output files
-                "-i",
-                input_file_path,
-                "-f",
-                "segment",
-                "-segment_time",
-                str(segment_time_seconds),
-                "-c",
-                "copy",  # Copy codec without re-encoding
-                "-reset_timestamps",
-                "1",  # Reset timestamps for each segment
-                output_pattern,
-            ]
+            
+            # For MP3 files, we need to re-encode to avoid corruption at frame boundaries
+            # For other formats, we can use copy if the codec supports it
+            file_ext_lower = extension.lower().lstrip(".")
+            is_mp3 = file_ext_lower in ["mp3", "mpga"]
+            
+            if is_mp3:
+                # Re-encode MP3 to ensure proper frame boundaries
+                # Use the original bitrate or a reasonable default
+                audio_bitrate_kbps = min(bitrate // 1000, 320)  # Cap at 320kbps
+                if audio_bitrate_kbps < 64:
+                    audio_bitrate_kbps = 192  # Minimum reasonable bitrate
+                
+                cmd = [
+                    "ffmpeg",
+                    "-y",  # Overwrite output files
+                    "-i",
+                    input_file_path,
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    str(segment_time_seconds),
+                    "-c:a",
+                    "libmp3lame",  # Use libmp3lame encoder
+                    "-b:a",
+                    f"{audio_bitrate_kbps}k",  # Use original bitrate
+                    "-reset_timestamps",
+                    "1",  # Reset timestamps for each segment
+                    output_pattern,
+                ]
+                logging.info(f"Re-encoding MP3 during split to prevent corruption (bitrate: {audio_bitrate_kbps}kbps)")
+            else:
+                # For other formats, try copy first (faster, no quality loss)
+                cmd = [
+                    "ffmpeg",
+                    "-y",  # Overwrite output files
+                    "-i",
+                    input_file_path,
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    str(segment_time_seconds),
+                    "-c",
+                    "copy",  # Copy codec without re-encoding
+                    "-reset_timestamps",
+                    "1",  # Reset timestamps for each segment
+                    output_pattern,
+                ]
 
             self._run_command(cmd)
 
-            # Find all generated chunk files
-            file_number = 1
-            while True:
-                chunk_name = f"{base_name}_part{file_number:03d}{extension}"
-                if os.path.exists(chunk_name):
-                    chunks.append(chunk_name)
-                    self._temp_files.append(chunk_name)
-                    file_number += 1
-                else:
-                    break
+            # Find all generated chunk files using glob pattern to ensure we get all files
+            # ffmpeg segment muxer creates files starting from 000
+            pattern = f"{base_name}_part*{extension}"
+            found_files = sorted(glob.glob(pattern))
+            
+            # Filter to only include files that match the exact pattern (exclude the original if it matches)
+            for chunk_file in found_files:
+                # Extract the part number from filename
+                chunk_basename = os.path.basename(chunk_file)
+                if chunk_basename.startswith(os.path.basename(base_name) + "_part") and chunk_basename != os.path.basename(input_file_path):
+                    chunks.append(chunk_file)
+                    self._temp_files.append(chunk_file)
 
             if not chunks:
                 raise SubtitleError(f"No chunks created from {input_file_path}.")
 
+            # Log all chunk files for debugging
             logging.info(
-                f"Split {input_file_path} into {len(chunks)} chunks using ffmpeg."
+                f"Split {input_file_path} into {len(chunks)} chunks using ffmpeg:"
             )
+            for i, chunk in enumerate(chunks, 1):
+                chunk_size = os.path.getsize(chunk) / (1024 * 1024)
+                logging.info(f"  Chunk {i}/{len(chunks)}: {os.path.basename(chunk)} ({chunk_size:.2f} MB)")
+            
             return chunks
 
         except (IOError, SubtitleError) as e:
@@ -419,6 +490,17 @@ class SubtitleProcessor:
                 f"File '{os.path.basename(input_file_path)}' ({file_size_mb:.2f} MB) within size limit."
             )
             return input_file_path, None
+        
+        # If downsampling is disabled, skip directly to splitting
+        if not ENABLE_DOWNSAMPLE:
+            logging.info(
+                f"File ({file_size_mb:.2f} MB) > limit ({MAX_FILE_SIZE_MB} MB). "
+                f"Downsampling disabled. Splitting into {CHUNK_SIZE_MB} MB chunks."
+            )
+            chunks = self._split_audio(input_file_path, CHUNK_SIZE_MB)
+            return chunks, "split"
+        
+        # Downsampling is enabled, try to downsample first
         logging.warning(
             f"File ({file_size_mb:.2f} MB) > limit ({MAX_FILE_SIZE_MB} MB). Attempting downsample."
         )
@@ -507,7 +589,7 @@ class SubtitleProcessor:
         output_video_path: str = None,  # Kept for compatibility, but not used in YT flow
         prompt: str = "",
         timestamp_granularities_str: str = "segment",
-        language: str = "ja",
+        language: str = None,
         auto_detect_language: bool = False,
         model: str = config.model,
         include_video: bool = False,  # Kept for compatibility
@@ -523,6 +605,9 @@ class SubtitleProcessor:
         processed_path_or_chunks = None
 
         try:
+            # Use config.language as default if language is not specified
+            if language is None:
+                language = config.language
             if not auto_detect_language and language not in LANGUAGE_CODES.values():
                 raise ValueError(
                     f"Invalid language code '{language}'. Check LANGUAGE_CODES."
@@ -543,6 +628,11 @@ class SubtitleProcessor:
                 processed_path_or_chunks if is_split else [processed_path_or_chunks]
             )
             # input_is_video = input_file_path.lower().endswith((".mp4", ".webm", ".mov")) # Less relevant now
+
+            logging.info(
+                f"Will process {len(files_to_process)} {'chunk(s)' if is_split else 'file(s)'}: "
+                f"{[os.path.basename(f) for f in files_to_process]}"
+            )
 
             timestamp_granularities_list = [
                 gran.strip()
@@ -748,7 +838,7 @@ def main():
                 previous_clipboard_content = current_clipboard_content
                 if is_youtube_url(current_clipboard_content):
                     logging.info(f"Detected YouTube link: {current_clipboard_content}")
-                    if is_language_desired(current_clipboard_content, "ja"):
+                    if is_language_desired(current_clipboard_content, config.language):
                         audio_file_path = None
                         try:
                             audio_file_path = download_audio(
@@ -816,7 +906,7 @@ def get_subs(processor, audio_file_path):
             input_file_path=audio_file_path,
             output_srt_path=output_srt_path,
             timestamp_granularities_str="segment",
-            language="ja",
+            language=config.language,
             auto_detect_language=False,
             include_video=False,
         )
